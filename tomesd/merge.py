@@ -1,5 +1,6 @@
 import torch
 from typing import Tuple, Callable
+import torch.nn.functional as F
 
 
 def do_nothing(x: torch.Tensor, mode:str=None):
@@ -15,12 +16,39 @@ def mps_gather_workaround(input, dim, index):
         ).squeeze(-1)
     else:
         return torch.gather(input, dim, index)
+    
 
+# Token Downsampling (ToDo) Downsampling function
+def todo_ds(x, w, h): #-> w, h are 64 maybe
+    B, P, D = x.shape[0], x.shape[1], x.shape[-1]  # x is originally sequence wise, which Transformers use
+    new_w, new_h = w // 2, h // 2  # Downsampling therefore // 2
+    x = x.reshape(B, w, h, -1).permute(0, 3, 1, 2)  # Reshape to be HWC-wise, like a CNN
+    x = F.interpolate(x, size=(new_w, new_h), mode="nearest").permute(0, 2, 3, 1)  # 2x2 ave-pool, like CNN
+    x = x.reshape(B, -1, D)  # Back to sequence-wise
+    return x
+
+
+# Token Downsampling (ToDo) Upsampling function
+def todo_us(x, w, h):
+    B, D = x.shape[0], x.shape[-1]
+    new_w, new_h = w * 2, h * 2  # Upsampling therefore * 2
+    x = x.reshape(B, w, h, -1).permute(0, 3, 1, 2)
+    x = F.interpolate(x, size=(new_w, new_h), mode="nearest").permute(0, 2, 3, 1)
+    x = x.reshape(B, -1, D)
+    return x
+
+
+# Lazy implementation of pruning that just zeros out the tensor rather than skipping compute.
+# This makes it friendlier to work with the DMD fine-tuning framework which expects the checkpoint to save/load with 28 Transformer blocks.
+def prune(x):
+    return x*0
+    
 
 def bipartite_soft_matching_random2d(metric: torch.Tensor,
                                      w: int, h: int, sx: int, sy: int, r: int,
                                      no_rand: bool = False,
-                                     generator: torch.Generator = None) -> Tuple[Callable, Callable]:
+                                     generator: torch.Generator = None,
+                                     ds_setting=0) -> Tuple[Callable, Callable]:
     """
     Partitions the tokens into src and dst and merges r tokens from src to dst.
     Dst tokens are partitioned by choosing one randomy in each (sx, sy) region.
@@ -34,11 +62,34 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
      - r: number of tokens to remove (by merging)
      - no_rand: if true, disable randomness (use top left corner only)
      - rand_seed: if no_rand is false, and if not None, sets random seed.
+     - ds_setting: ADDED BY KEITH. Controls what to do - ToMe, ToDo, pruning or even do nothing.
+        0 -> Do nothing (cost is 1)
+        1 -> Apply Token Merging to reduce #tokens by 50% (cost is 0.5)
+        2 -> Apply Token Merging to reduce #tokens by 75% (cost is 0.25)
+        3 -> Apply Token Downsampling, which uses a 2x2 downsample/upsample (cost is 0.25)
+        4 -> Outright prune the transformer blk: SA, CA and MLP (cost is 0)
     """
     B, N, _ = metric.shape
-
-    if r <= 0:
+    
+    # Do nothing - cost of block is still 1.
+    if ds_setting == 0:
         return do_nothing, do_nothing
+    
+    # Prune the block - cost is now 0.
+    elif ds_setting == 4:
+        return prune, prune
+    
+    # Apply token downsampling 2x2 - cost is 0.25
+    elif ds_setting == 3:
+        return lambda x: todo_ds(x, w*2, h*2), lambda x: todo_us(x, w*2, h*2)
+    
+    # Apply token merging 50% - cost is 0.5
+    elif ds_setting == 1:
+        r = int(metric.shape[1] * 0.5)
+    
+    # Apply token merging 75% equal to 2x2 DS - cost is 0.25
+    elif ds_setting == 2:
+        r = int(metric.shape[1] * 0.75)
 
     gather = mps_gather_workaround if metric.device.type == "mps" else torch.gather
     

@@ -7,12 +7,13 @@ from .utils import isinstance_str, init_generator
 
 
 
-def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable, ...]:
+def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any], idx: int) -> Tuple[Callable, ...]:
     original_h, original_w = tome_info["size"]
     original_tokens = original_h * original_w
     downsample = int(math.ceil(math.sqrt(original_tokens // x.shape[1])))
 
     args = tome_info["args"]
+    ds_setting = args['tsx_list'][idx]
 
     if downsample <= args["max_downsample"]:
         w = int(math.ceil(original_w / downsample))
@@ -29,7 +30,7 @@ def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable,
         # batch, which causes artifacts with use_rand, so force it to be off.
         use_rand = False if x.shape[0] % 2 == 1 else args["use_rand"]
         m, u = merge.bipartite_soft_matching_random2d(x, w, h, args["sx"], args["sy"], r, 
-                                                      no_rand=not use_rand, generator=args["generator"])
+                                                      no_rand=not use_rand, generator=args["generator"], ds_setting=ds_setting)
     else:
         m, u = (merge.do_nothing, merge.do_nothing)
 
@@ -56,7 +57,7 @@ def make_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]
         _parent = block_class
 
         def _forward(self, x: torch.Tensor, context: torch.Tensor = None) -> torch.Tensor:
-            m_a, m_c, m_m, u_a, u_c, u_m = compute_merge(x, self._tome_info)
+            m_a, m_c, m_m, u_a, u_c, u_m = compute_merge(x, self._tome_info, self._idx)
 
             # This is where the meat of the computation happens
             x = u_a(self.attn1(m_a(self.norm1(x)), context=context if self.disable_self_attn else None)) + x
@@ -80,7 +81,7 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.
     class ToMeBlock(block_class):
         # Save for unpatching later
         _parent = block_class
-
+        num=0
         def forward(
             self,
             hidden_states,
@@ -90,40 +91,82 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.
             timestep=None,
             cross_attention_kwargs=None,
             class_labels=None,
+            added_cond_kwargs=None,
         ) -> torch.Tensor:
             # (1) ToMe
-            m_a, m_c, m_m, u_a, u_c, u_m = compute_merge(hidden_states, self._tome_info)
+            # m/u - Merge/unmerge
+            # a/c/m - SA/CA/MLP
+            #print("ToMe Blk", ToMeBlock.num)
+            ToMeBlock.num += 1
+            m_a, m_c, m_m, u_a, u_c, u_m = compute_merge(hidden_states, self._tome_info, self._idx)
 
-            if self.use_ada_layer_norm:
+            batch_size = hidden_states.shape[0]
+
+            if self.norm_type == "ada_norm":
                 norm_hidden_states = self.norm1(hidden_states, timestep)
-            elif self.use_ada_layer_norm_zero:
+            elif self.norm_type == "ada_norm_zero":
                 norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
                     hidden_states, timestep, class_labels, hidden_dtype=hidden_states.dtype
                 )
-            else:
+            elif self.norm_type in ["layer_norm", "layer_norm_i2vgen"]:
                 norm_hidden_states = self.norm1(hidden_states)
+            elif self.norm_type == "ada_norm_continuous":
+                norm_hidden_states = self.norm1(hidden_states, added_cond_kwargs["pooled_text_emb"])
+            elif self.norm_type == "ada_norm_single":
+                shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                    self.scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
+                ).chunk(6, dim=1)
+                norm_hidden_states = self.norm1(hidden_states)
+                norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
+            else:
+                raise ValueError("Incorrect norm used")
+
+            if self.pos_embed is not None:
+                norm_hidden_states = self.pos_embed(norm_hidden_states)
 
             # (2) ToMe m_a
             norm_hidden_states = m_a(norm_hidden_states)
 
             # 1. Self-Attention
-            cross_attention_kwargs = cross_attention_kwargs if cross_attention_kwargs is not None else {}
+            # 1. Prepare GLIGEN inputs
+            cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
+            gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
             attn_output = self.attn1(
                 norm_hidden_states,
                 encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
                 attention_mask=attention_mask,
                 **cross_attention_kwargs,
             )
-            if self.use_ada_layer_norm_zero:
+            if self.norm_type == "ada_norm_zero":
                 attn_output = gate_msa.unsqueeze(1) * attn_output
+            elif self.norm_type == "ada_norm_single":
+                attn_output = gate_msa * attn_output
 
             # (3) ToMe u_a
             hidden_states = u_a(attn_output) + hidden_states
+            if hidden_states.ndim == 4:
+                hidden_states = hidden_states.squeeze(1)
+            
+            # 1.2 GLIGEN Control
+            if gligen_kwargs is not None:
+                hidden_states = self.fuser(hidden_states, gligen_kwargs["objs"])
 
             if self.attn2 is not None:
-                norm_hidden_states = (
-                    self.norm2(hidden_states, timestep) if self.use_ada_layer_norm else self.norm2(hidden_states)
-                )
+                if self.norm_type == "ada_norm":
+                    norm_hidden_states = self.norm2(hidden_states, timestep)
+                elif self.norm_type in ["ada_norm_zero", "layer_norm", "layer_norm_i2vgen"]:
+                    norm_hidden_states = self.norm2(hidden_states)
+                elif self.norm_type == "ada_norm_single":
+                    # For PixArt norm2 isn't applied here:
+                    # https://github.com/PixArt-alpha/PixArt-alpha/blob/0f55e922376d8b797edd44d25d0e7464b260dcab/diffusion/model/nets/PixArtMS.py#L70C1-L76C103
+                    norm_hidden_states = hidden_states
+                elif self.norm_type == "ada_norm_continuous":
+                    norm_hidden_states = self.norm2(hidden_states, added_cond_kwargs["pooled_text_emb"])
+                else:
+                    raise ValueError("Incorrect norm")
+
+                if self.pos_embed is not None and self.norm_type != "ada_norm_single":
+                    norm_hidden_states = self.pos_embed(norm_hidden_states)
                 # (4) ToMe m_c
                 norm_hidden_states = m_c(norm_hidden_states)
 
@@ -138,22 +181,35 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.
                 hidden_states = u_c(attn_output) + hidden_states
 
             # 3. Feed-forward
-            norm_hidden_states = self.norm3(hidden_states)
-            
-            if self.use_ada_layer_norm_zero:
+            if self.norm_type == "ada_norm_continuous":
+                norm_hidden_states = self.norm3(hidden_states, added_cond_kwargs["pooled_text_emb"])
+            elif not self.norm_type == "ada_norm_single":
+                norm_hidden_states = self.norm3(hidden_states)
+
+            if self.norm_type == "ada_norm_zero":
                 norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+
+            if self.norm_type == "ada_norm_single":
+                norm_hidden_states = self.norm2(hidden_states)
+                norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
 
             # (6) ToMe m_m
             norm_hidden_states = m_m(norm_hidden_states)
 
-            ff_output = self.ff(norm_hidden_states)
+            if self._chunk_size is not None:
+                ff_output = _chunked_feed_forward(self.ff, norm_hidden_states, self._chunk_dim, self._chunk_size)
+            else:
+                ff_output = self.ff(norm_hidden_states)
 
-            if self.use_ada_layer_norm_zero:
+            if self.norm_type == "ada_norm_zero":
                 ff_output = gate_mlp.unsqueeze(1) * ff_output
+            elif self.norm_type == "ada_norm_single":
+                ff_output = gate_mlp * ff_output
 
             # (7) ToMe u_m
             hidden_states = u_m(ff_output) + hidden_states
-
+            if hidden_states.ndim == 4:
+                hidden_states = hidden_states.squeeze(1)
             return hidden_states
 
     return ToMeBlock
@@ -186,7 +242,8 @@ def apply_patch(
         use_rand: bool = True,
         merge_attn: bool = True,
         merge_crossattn: bool = False,
-        merge_mlp: bool = False):
+        merge_mlp: bool = False,
+        tsx_list=[0] * 28):
     """
     Patches a stable diffusion model with ToMe.
     Apply this to the highest level stable diffusion object (i.e., it should have a .model.diffusion_model).
@@ -221,8 +278,8 @@ def apply_patch(
             raise RuntimeError("Provided model was not a Stable Diffusion / Latent Diffusion model, as expected.")
         diffusion_model = model.model.diffusion_model
     else:
-        # Supports "pipe.unet" and "unet"
-        diffusion_model = model.unet if hasattr(model, "unet") else model
+        # Supports "pipe.transformer" and "transformer"
+        diffusion_model = model.transformer if hasattr(model, "transformer") else model
 
     diffusion_model._tome_info = {
         "size": None,
@@ -235,17 +292,21 @@ def apply_patch(
             "generator": None,
             "merge_attn": merge_attn,
             "merge_crossattn": merge_crossattn,
-            "merge_mlp": merge_mlp
+            "merge_mlp": merge_mlp,
+            "tsx_list": tsx_list
         }
     }
     hook_tome_model(diffusion_model)
 
-    for _, module in diffusion_model.named_modules():
+    i = 0
+    for key, module in diffusion_model.named_modules():
         # If for some reason this has a different name, create an issue and I'll fix it
         if isinstance_str(module, "BasicTransformerBlock"):
+            #if tsx_list is not None and int(key.split(".")[-1]) in tsx_list:
             make_tome_block_fn = make_diffusers_tome_block if is_diffusers else make_tome_block
             module.__class__ = make_tome_block_fn(module.__class__)
             module._tome_info = diffusion_model._tome_info
+            module._idx = i
 
             # Something introduced in SD 2.0 (LDM only)
             if not hasattr(module, "disable_self_attn") and not is_diffusers:
@@ -265,7 +326,7 @@ def apply_patch(
 def remove_patch(model: torch.nn.Module):
     """ Removes a patch from a ToMe Diffusion module if it was already patched. """
     # For diffusers
-    model = model.unet if hasattr(model, "unet") else model
+    model = model.transformer if hasattr(model, "transformer") else model
 
     for _, module in model.named_modules():
         if hasattr(module, "_tome_info"):
